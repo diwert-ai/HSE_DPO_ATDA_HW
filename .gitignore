@@ -1,7 +1,2 @@
-/.ipynb_checkpoints
-/CamVid
-/CamVid.zip
-/checkpoints
-/lightning_logs
 /.vscode
-/logs
+/.nfs*
