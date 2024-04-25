@@ -4,6 +4,8 @@ import torchvision.transforms.functional
 warnings.filterwarnings("ignore")
 
 import os
+import math
+from datetime import datetime
 
 import cv2
 import numpy as np
@@ -22,19 +24,54 @@ import timm
 
 from PIL import ImageDraw, ImageFont
 
-DATA_DIR = './CamVid/'
+class Config:
+    data_dir = './CamVid/'
+    log_font = ImageFont.truetype("/usr/share/fonts/truetype/freefont/FreeMono.ttf", 28, encoding="unic")
+    num_log_images = 4
+    top_bottom_k = 4
+    devices = 1
+    nodes = 1
+    num_workers = 10
+    accelerator = 'gpu'
+    
+    hparams = {
+        'experiment': 'Debug',
+        'arch': 'UNet',
+        'backbone': 'mixnet_l',
+        'loss': 'Dice+BCE',
+        'epochs' : 70,
+        'train_batch_size' : 16,
+        'valid_batch_size' : 8,
+        'test_batch_size' : 8,
+        'lr' : 1e-4,
+        'weight_decay': 1e-4,
+        'gamma':  0.99,
+        'seed': 42,
+    }
+
+
 
 class UNET(nn.Module):
 
-    def __init__(self, n_classes, last_act='', pretrained=True):
+    def __init__(self, n_classes, last_act='', pretrained=True, backbone='resnet18'):
         super().__init__()
 
         # в init определяются подмодули и буферы
-        self.encoder = timm.create_model('efficientnet_b0', features_only=True, pretrained=pretrained)
-        self.decoder_conv1 = nn.Conv2d(432, 256, (3, 3), padding=1)
-        self.decoder_conv2 = nn.Conv2d(296, 128, (3, 3), padding=1)
-        self.decoder_conv3 = nn.Conv2d(152, 64, (3, 3), padding=1)
-        self.decoder_conv4 = nn.Conv2d(80, 64, (3, 3), padding=1)
+        self.encoder = timm.create_model(backbone, features_only=True, pretrained=pretrained)
+        
+        acts = self.encoder(torch.randn(1, 3, 480, 384))[:5]
+
+        ch_in = acts[4].shape[1] + acts[3].shape[1]
+        self.decoder_conv1 = nn.Conv2d(ch_in, 256, (3, 3), padding=1)
+
+        ch_in = 256 + acts[2].shape[1]
+        self.decoder_conv2 = nn.Conv2d(ch_in, 128, (3, 3), padding=1)
+
+        ch_in = 128 + acts[1].shape[1]
+        self.decoder_conv3 = nn.Conv2d(ch_in, 64, (3, 3), padding=1)
+
+        ch_in = 64 + acts[0].shape[1]
+        self.decoder_conv4 = nn.Conv2d(ch_in, 64, (3, 3), padding=1)
 
         # kernel_size = (1, 1) превращает Conv2d слой по сути в Linear слой,
         # который обрабатывает каждый пиксель в отдельности
@@ -93,7 +130,9 @@ def dice_score(output, target, eps=1e-7):
     target (Tensor): of shape (b, n_classes, h, w)
   """
   b, n_classes, h, w = output.shape
-  dice_score = (2.0 * torch.sum(output * target)) / (torch.sum(output + target) * b * n_classes).clamp_min(eps)
+  union = torch.sum(output + target) * b * n_classes
+  eps = eps if union < eps else 0.0
+  dice_score = (2.0 * torch.sum(output * target) + eps) / (union + eps)
   return dice_score
 
 def dice_loss(output, target):
@@ -244,7 +283,7 @@ class SegModel(pl.LightningModule):
             return img / 255.
         preprocessing_fn = div_by_255
 
-        self.model = UNET(n_classes=1, last_act='sigmoid')
+        self.model = UNET(n_classes=1, last_act='sigmoid', backbone=Config.hparams['backbone'])
 
         self.bce_loss = nn.BCELoss()
 
@@ -292,15 +331,15 @@ class SegModel(pl.LightningModule):
             'train': 0,
         }
 
-        self.n_log = 4
-        self.k = 4
+        self.n_log = Config.num_log_images
+        self.k = Config.top_bottom_k
         
         self.k_iou_batch = {
             'val': [list(), list()],
             'test': [list(), list()],
             'train': [list(), list()],
         }
-        self.log_font = ImageFont.truetype("/usr/share/fonts/truetype/freefont/FreeMono.ttf", 28, encoding="unic")
+        self.log_font = Config.log_font
 
     def forward(self, x):
         return self.model(x)
@@ -330,9 +369,9 @@ class SegModel(pl.LightningModule):
             img_top, img_bottom = data_top[i][0]['img'], data_bottom[i][0]['img']
             acc_top, acc_bottom = 100 * data_top[i][0]['acc'], 100 * data_bottom[i][0]['acc']
 
-            iou_top, iou_bottom = round(100 * data_top[i][1], 2), round(100 * data_bottom[i][1], 2)
+            iou_top, iou_bottom = 100 * data_top[i][1], 100 * data_bottom[i][1]
                 
-            text_iou_top, text_iou_bottom = f'IoU {iou_top}%', f'IoU {iou_bottom}%'
+            text_iou_top, text_iou_bottom = f'IoU {iou_top:.2f}%', f'IoU {iou_bottom:.2f}%'
             text_acc_top, text_acc_bottom = f'Acc {acc_top:.2f}%', f'Acc {acc_bottom:.2f}%'
 
 
@@ -403,7 +442,10 @@ class SegModel(pl.LightningModule):
         jacc = BinaryJaccardIndex().to(self.device)
         acc = BinaryAccuracy().to(self.device)
         def get_iou(i):
-            return jacc(out[i], mask[i]).item()
+            iou = jacc(out[i], mask[i]).item()
+            if math.isnan(iou):
+                iou = 1.0
+            return iou
         
         def get_record(i):
             return {'img': img[i],
@@ -453,38 +495,50 @@ class SegModel(pl.LightningModule):
         self.on_eval_epoch_end('test', **kwargs)
 
     def configure_optimizers(self):
-        opt = torch.optim.Adam(self.model.parameters(), lr=0.0001, weight_decay=0.001)
+        opt = torch.optim.Adam(self.model.parameters(),
+                               lr=Config.hparams['lr'],
+                               weight_decay=Config.hparams['weight_decay'],
+                               )
         sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=10)
         return [opt], [sch]
 
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=32, num_workers=os.cpu_count(), shuffle=True)
+        return DataLoader(self.train_dataset,
+                          batch_size=Config.hparams['train_batch_size'], 
+                          num_workers=Config.num_workers, 
+                          shuffle=True)
 
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=8, num_workers=os.cpu_count(), shuffle=False)
+        return DataLoader(self.val_dataset,
+                          batch_size=Config.hparams['valid_batch_size'],
+                          num_workers=Config.num_workers,
+                          shuffle=False)
 
     def test_dataloader(self):
-        return DataLoader(self.test_dataset, batch_size=8, num_workers=os.cpu_count(), shuffle=False)
+        return DataLoader(self.test_dataset,
+                          batch_size=Config.hparams['test_batch_size'],
+                          num_workers=Config.num_workers,
+                          shuffle=False)
     
 
 
 if __name__ == '__main__':
     pl.seed_everything(42)
-    seg_model = SegModel(DATA_DIR)
+    seg_model = SegModel(Config.data_dir)
     checkpoint_callback = pl.callbacks.ModelCheckpoint(dirpath='checkpoints', 
                                                        monitor="IOU/val", 
                                                        mode="max"
                                                        )
-    
+    stamp = f'{datetime.now()}'.replace(':','-')
     logger = pl.loggers.TensorBoardLogger(save_dir="./",
-                                          version='bce_dice_70eps' 
+                                          version=f'debug_{stamp}_{Config.hparams['backbone']}' 
                                           )
     
     trainer = pl.Trainer(callbacks=[checkpoint_callback],
-                         accelerator ='gpu',
-                         devices=1,
-                         num_nodes=1,
-                         max_epochs=70,
+                         accelerator = Config.accelerator,
+                         devices=Config.devices,
+                         num_nodes=Config.nodes,
+                         max_epochs=Config.hparams['epochs'],
                          num_sanity_val_steps=0, 
                          # log_every_n_steps=6,
                          logger=logger,
